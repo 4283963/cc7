@@ -1,3 +1,4 @@
 {
+  "/not-found": "app/not-found.js",
   "/cargo/monitor/page": "app/cargo/monitor/page.js"
 }

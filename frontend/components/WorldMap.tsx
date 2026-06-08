@@ -1,13 +1,18 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useCallback, useMemo } from 'react'
 import * as echarts from 'echarts'
 import { TrajectoryPoint } from '@/lib/api'
 import { tempToColor } from '@/lib/utils'
 
+interface ContainerTrajectory {
+  containerId: string
+  points: TrajectoryPoint[]
+  color?: string
+}
+
 interface WorldMapProps {
-  trajectory: TrajectoryPoint[]
-  selectedContainer: string
+  trajectories: ContainerTrajectory[]
   attributionSegments?: Array<{
     lat_start: number
     lon_start: number
@@ -17,23 +22,71 @@ interface WorldMapProps {
     sea_area: string
     confidence: number
   }>
-  onPointClick?: (point: TrajectoryPoint) => void
+  onPointClick?: (containerId: string, point: TrajectoryPoint) => void
 }
 
+const CONTAINER_COLORS = [
+  '#3b82f6',
+  '#10b981',
+  '#f59e0b',
+  '#ef4444',
+  '#8b5cf6',
+  '#ec4899',
+  '#06b6d4',
+  '#f97316',
+]
+
 export default function WorldMap({
-  trajectory,
-  selectedContainer,
+  trajectories,
   attributionSegments = [],
   onPointClick,
 }: WorldMapProps) {
   const chartRef = useRef<HTMLDivElement>(null)
   const chartInstance = useRef<echarts.ECharts | null>(null)
+  const pointDataRef = useRef<
+    Map<
+      string,
+      Map<
+        string,
+        { containerId: string; point: TrajectoryPoint }
+      >
+    >
+  >(new Map())
+
+  const getContainerColor = useCallback((index: number) => {
+    return CONTAINER_COLORS[index % CONTAINER_COLORS.length]
+  }, [])
+
+  const handleClick = useCallback(
+    (params: any) => {
+      if (!onPointClick) return
+
+      if (params.seriesType === 'scatter' && params.data) {
+        const seriesName = params.seriesName
+        const data = params.data
+        const containerId = data.containerId || seriesName
+
+        const point: TrajectoryPoint = {
+          timestamp: data.timestamp,
+          latitude: data.value[1],
+          longitude: data.value[0],
+          temperature: data.value[2],
+          humidity: data.humidity || 0,
+        }
+
+        onPointClick(containerId, point)
+      }
+    },
+    [onPointClick]
+  )
 
   useEffect(() => {
     if (!chartRef.current) return
 
     if (!chartInstance.current) {
       chartInstance.current = echarts.init(chartRef.current, 'dark')
+
+      chartInstance.current.on('click', handleClick)
 
       const handleResize = () => {
         chartInstance.current?.resize()
@@ -42,54 +95,148 @@ export default function WorldMap({
 
       return () => {
         window.removeEventListener('resize', handleResize)
+        chartInstance.current?.off('click', handleClick)
         chartInstance.current?.dispose()
         chartInstance.current = null
       }
     }
+  }, [handleClick])
 
-    const lineData: any[] = []
-    const scatterData: any[] = []
-    const trailCoords: number[][] = []
+  const chartOption = useMemo(() => {
+    pointDataRef.current.clear()
 
-    if (trajectory.length > 0) {
-      for (let i = 0; i < trajectory.length - 1; i++) {
-        const p1 = trajectory[i]
-        const p2 = trajectory[i + 1]
-        const midTemp = (p1.temperature + p2.temperature) / 2
-        const color = tempToColor(midTemp)
+    const series: echarts.SeriesOption[] = []
 
-        lineData.push({
-          coords: [
-            [p1.longitude, p1.latitude],
-            [p2.longitude, p2.latitude],
-          ],
+    trajectories.forEach((traj, trajIndex) => {
+      const { containerId, points } = traj
+      const baseColor = traj.color || getContainerColor(trajIndex)
+
+      const pointMap = new Map<string, { containerId: string; point: TrajectoryPoint }>()
+
+      if (points.length >= 2) {
+        const lineData: any[] = []
+
+        for (let i = 0; i < points.length - 1; i++) {
+          const p1 = points[i]
+          const p2 = points[i + 1]
+          const midTemp = (p1.temperature + p2.temperature) / 2
+          const lineColor = tempToColor(midTemp)
+
+          lineData.push({
+            coords: [
+              [p1.longitude, p1.latitude],
+              [p2.longitude, p2.latitude],
+            ],
+            fromName: containerId,
+            toName: containerId,
+            lineStyle: {
+              color: lineColor,
+              width: 2.5,
+              opacity: 0.85,
+            },
+          })
+        }
+
+        series.push({
+          name: `${containerId}-航线`,
+          type: 'lines',
+          coordinateSystem: 'geo',
+          zlevel: 2 + trajIndex * 2,
+          effect: {
+            show: true,
+            period: 6 + trajIndex * 2,
+            trailLength: 0.1,
+            symbol: 'arrow',
+            symbolSize: 6,
+            color: baseColor,
+          },
           lineStyle: {
-            color: color,
-            width: 2.5,
-            opacity: 0.9,
+            width: 2,
+            opacity: 0.5,
+            curveness: 0.05,
           },
+          data: lineData,
+          silent: true,
         })
 
-        trailCoords.push([p1.longitude, p1.latitude])
-      }
+        const scatterData: any[] = []
+        const sampleRate = Math.max(1, Math.floor(points.length / 40))
 
-      const lastPoint = trajectory[trajectory.length - 1]
-      trailCoords.push([lastPoint.longitude, lastPoint.latitude])
+        for (let i = 0; i < points.length; i += sampleRate) {
+          const p = points[i]
+          const key = `${p.longitude.toFixed(4)}_${p.latitude.toFixed(4)}`
 
-      const sampleRate = Math.max(1, Math.floor(trajectory.length / 50))
-      for (let i = 0; i < trajectory.length; i += sampleRate) {
-        const p = trajectory[i]
+          pointMap.set(key, { containerId, point: p })
+
+          scatterData.push({
+            name: containerId,
+            value: [p.longitude, p.latitude, p.temperature],
+            itemStyle: {
+              color: tempToColor(p.temperature),
+              borderColor: baseColor,
+              borderWidth: 1.5,
+            },
+            containerId: containerId,
+            timestamp: p.timestamp,
+            temp: p.temperature,
+            humidity: p.humidity,
+          })
+        }
+
+        const endPoint = points[points.length - 1]
         scatterData.push({
-          value: [p.longitude, p.latitude, p.temperature],
+          name: containerId,
+          value: [endPoint.longitude, endPoint.latitude, endPoint.temperature],
           itemStyle: {
-            color: tempToColor(p.temperature),
+            color: baseColor,
+            borderColor: '#fff',
+            borderWidth: 2,
           },
-          timestamp: p.timestamp,
-          temp: p.temperature,
-          humidity: p.humidity,
+          symbolSize: 14,
+          containerId: containerId,
+          timestamp: endPoint.timestamp,
+          temp: endPoint.temperature,
+          humidity: endPoint.humidity,
+          isEndPoint: true,
         })
+
+        series.push({
+          name: `${containerId}-采样点`,
+          type: 'scatter',
+          coordinateSystem: 'geo',
+          zlevel: 3 + trajIndex * 2,
+          symbolSize: (data: any) => {
+            return data.isEndPoint ? 14 : 7
+          },
+          data: scatterData,
+          label: {
+            show: true,
+            formatter: (params: any) => {
+              if (params.data.isEndPoint) {
+                return `{name|${params.data.containerId}}`
+              }
+              return ''
+            },
+            position: 'right',
+            rich: {
+              name: {
+                color: '#fff',
+                fontSize: 10,
+                fontWeight: 'bold',
+                backgroundColor: 'rgba(0,0,0,0.6)',
+                padding: [2, 6],
+                borderRadius: 3,
+              },
+            },
+          },
+          emphasis: {
+            scale: 1.5,
+          },
+        })
+
+        pointDataRef.current.set(containerId, pointMap)
       }
-    }
+    })
 
     const attrLines: any[] = []
     attributionSegments.forEach((seg) => {
@@ -120,6 +267,17 @@ export default function WorldMap({
       })
     })
 
+    if (attrLines.length > 0) {
+      series.push({
+        name: '归因区段',
+        type: 'lines',
+        coordinateSystem: 'geo',
+        zlevel: 100,
+        data: attrLines,
+        silent: false,
+      })
+    }
+
     const option: echarts.EChartsOption = {
       backgroundColor: 'transparent',
       tooltip: {
@@ -130,16 +288,25 @@ export default function WorldMap({
           color: '#e5e7eb',
         },
         formatter: (params: any) => {
-          if (params.seriesType === 'scatter') {
+          if (params.seriesType === 'scatter' && params.data) {
             const data = params.data
+            const tempColor = data.itemStyle?.color || '#fff'
             return `
-              <div style="padding: 4px;">
-                <div style="font-weight: 600; margin-bottom: 6px;">📍 位置信息</div>
-                <div>温度: <span style="color: ${data.itemStyle?.color || '#fff'}; font-weight: 600;">${data.value[2] > 0 ? '+' : ''}${data.value[2].toFixed(1)}°C</span></div>
-                <div>湿度: ${data.humidity?.toFixed(1)}%</div>
-                <div>经度: ${data.value[0].toFixed(4)}</div>
-                <div>纬度: ${data.value[1].toFixed(4)}</div>
-                <div style="margin-top: 4px; color: #9ca3af; font-size: 12px;">${data.timestamp}</div>
+              <div style="padding: 4px; min-width: 160px;">
+                <div style="font-weight: 600; margin-bottom: 6px; color: ${data.containerId ? '#60a5fa' : '#fff'}">
+                  📍 ${data.containerId || '位置信息'}
+                </div>
+                <div style="margin: 4px 0;">
+                  温度: <span style="color: ${tempColor}; font-weight: 600;">
+                    ${data.value[2] > 0 ? '+' : ''}${data.value[2].toFixed(1)}°C
+                  </span>
+                </div>
+                <div style="margin: 4px 0;">湿度: ${data.humidity?.toFixed(1)}%</div>
+                <div style="margin: 4px 0;">经度: ${data.value[0].toFixed(4)}</div>
+                <div style="margin: 4px 0;">纬度: ${data.value[1].toFixed(4)}</div>
+                <div style="margin-top: 6px; color: #9ca3af; font-size: 11px; border-top: 1px solid #374151; padding-top: 6px;">
+                  ${data.timestamp || ''}
+                </div>
               </div>
             `
           }
@@ -171,67 +338,24 @@ export default function WorldMap({
           },
         },
       },
-      series: [
-        {
-          name: '航线轨迹',
-          type: 'lines',
-          coordinateSystem: 'geo',
-          zlevel: 2,
-          effect: {
-            show: true,
-            period: 6,
-            trailLength: 0.1,
-            symbol: 'arrow',
-            symbolSize: 6,
-            color: '#60a5fa',
-          },
-          lineStyle: {
-            width: 2,
-            opacity: 0.6,
-            curveness: 0.1,
-          },
-          data: lineData,
-        },
-        {
-          name: '温度采样点',
-          type: 'scatter',
-          coordinateSystem: 'geo',
-          zlevel: 3,
-          symbolSize: 8,
-          data: scatterData,
-        },
-        {
-          name: '归因区段',
-          type: 'lines',
-          coordinateSystem: 'geo',
-          zlevel: 4,
-          data: attrLines,
-          silent: false,
-        },
-      ],
+      series: series,
     }
 
-    chartInstance.current.setOption(option, true)
+    return option
+  }, [trajectories, attributionSegments, getContainerColor])
 
-    const handleClick = (params: any) => {
-      if (params.seriesType === 'scatter' && onPointClick) {
-        const point = trajectory.find(
-          (p) =>
-            Math.abs(p.longitude - params.data.value[0]) < 0.001 &&
-            Math.abs(p.latitude - params.data.value[1]) < 0.001
-        )
-        if (point) {
-          onPointClick(point)
-        }
-      }
+  useEffect(() => {
+    if (!chartInstance.current) return
+
+    try {
+      chartInstance.current.setOption(chartOption, {
+        notMerge: true,
+        lazyUpdate: false,
+      })
+    } catch (e) {
+      console.error('ECharts setOption error:', e)
     }
-
-    chartInstance.current.on('click', handleClick)
-
-    return () => {
-      chartInstance.current?.off('click', handleClick)
-    }
-  }, [trajectory, selectedContainer, attributionSegments, onPointClick])
+  }, [chartOption])
 
   return (
     <div

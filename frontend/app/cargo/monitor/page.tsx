@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import dynamic from 'next/dynamic'
 import {
   containerApi,
@@ -19,6 +19,7 @@ import TemperatureLegend from '@/components/TemperatureLegend'
 import TempChart from '@/components/TempChart'
 import CurrentTime from '@/components/CurrentTime'
 import { registerWorldMap } from '@/lib/mapData'
+import { formatTemperature } from '@/lib/utils'
 
 const WorldMap = dynamic(() => import('@/components/WorldMap'), {
   ssr: false,
@@ -29,10 +30,13 @@ const WorldMap = dynamic(() => import('@/components/WorldMap'), {
   ),
 })
 
+const DEFAULT_SELECTED = ['CONT-SEA-001', 'CONT-SEA-002']
+
 export default function CargoMonitorPage() {
   const [containers, setContainers] = useState<ContainerInfo[]>([])
-  const [selectedContainer, setSelectedContainer] = useState<string>('CONT-SEA-001')
-  const [trajectory, setTrajectory] = useState<TrajectoryPoint[]>([])
+  const [selectedContainers, setSelectedContainers] = useState<string[]>(DEFAULT_SELECTED)
+  const [trajectoryMap, setTrajectoryMap] = useState<Map<string, TrajectoryPoint[]>>(new Map())
+  const [loadingContainers, setLoadingContainers] = useState<Set<string>>(new Set())
   const [anomalies, setAnomalies] = useState<AnomalyEvent[]>([])
   const [selectedAnomaly, setSelectedAnomaly] = useState<AnomalyEvent | null>(null)
   const [attributionResult, setAttributionResult] = useState<AttributionResult | null>(null)
@@ -50,13 +54,41 @@ export default function CargoMonitorPage() {
   }, [])
 
   const loadTrajectory = useCallback(async (containerId: string) => {
+    setLoadingContainers((prev) => new Set(prev).add(containerId))
     try {
       const res = await containerApi.getTrajectory(containerId, 168)
-      setTrajectory(res.data.trajectory)
+      setTrajectoryMap((prev) => {
+        const next = new Map(prev)
+        next.set(containerId, res.data.trajectory)
+        return next
+      })
     } catch (e) {
       console.error('Failed to load trajectory:', e)
+    } finally {
+      setLoadingContainers((prev) => {
+        const next = new Set(prev)
+        next.delete(containerId)
+        return next
+      })
     }
   }, [])
+
+  const handleToggleContainer = useCallback(
+    (containerId: string) => {
+      setSelectedContainers((prev) => {
+        const exists = prev.includes(containerId)
+        if (exists) {
+          return prev.filter((id) => id !== containerId)
+        } else {
+          if (!trajectoryMap.has(containerId) && !loadingContainers.has(containerId)) {
+            loadTrajectory(containerId)
+          }
+          return [...prev, containerId]
+        }
+      })
+    },
+    [trajectoryMap, loadingContainers, loadTrajectory]
+  )
 
   const loadAnomalies = useCallback(async () => {
     try {
@@ -74,6 +106,13 @@ export default function CargoMonitorPage() {
       setAttributionLoading(true)
       setAttributionResult(null)
 
+      if (!selectedContainers.includes(anomaly.container_id)) {
+        setSelectedContainers((prev) => [...prev, anomaly.container_id])
+        if (!trajectoryMap.has(anomaly.container_id)) {
+          await loadTrajectory(anomaly.container_id)
+        }
+      }
+
       try {
         const res = await attributionApi.analyze(anomaly.container_id, anomaly.id)
         setAttributionResult(res.data)
@@ -83,7 +122,7 @@ export default function CargoMonitorPage() {
         setAttributionLoading(false)
       }
     },
-    []
+    [selectedContainers, trajectoryMap, loadTrajectory]
   )
 
   const handleUpdateOrder = useCallback(
@@ -93,13 +132,14 @@ export default function CargoMonitorPage() {
     []
   )
 
-  const handleSelectContainer = useCallback(
-    (containerId: string) => {
-      setSelectedContainer(containerId)
-      loadTrajectory(containerId)
-    },
-    [loadTrajectory]
-  )
+  const mapTrajectories = useMemo(() => {
+    return selectedContainers
+      .filter((id) => trajectoryMap.has(id))
+      .map((containerId) => ({
+        containerId,
+        points: trajectoryMap.get(containerId) || [],
+      }))
+  }, [selectedContainers, trajectoryMap])
 
   useEffect(() => {
     registerWorldMap().then(() => setMapReady(true))
@@ -109,9 +149,13 @@ export default function CargoMonitorPage() {
 
   useEffect(() => {
     if (containers.length > 0) {
-      loadTrajectory(selectedContainer)
+      DEFAULT_SELECTED.forEach((id) => {
+        if (containers.some((c) => c.id === id) && !trajectoryMap.has(id)) {
+          loadTrajectory(id)
+        }
+      })
     }
-  }, [containers, selectedContainer, loadTrajectory])
+  }, [containers, trajectoryMap, loadTrajectory])
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -122,10 +166,38 @@ export default function CargoMonitorPage() {
 
   const ongoingAnomalies = anomalies.filter((a) => a.status === 'ongoing').length
   const criticalCount = anomalies.filter((a) => a.severity === 'critical').length
-  const avgTemp =
-    trajectory.length > 0
-      ? trajectory.reduce((sum, p) => sum + p.temperature, 0) / trajectory.length
-      : 0
+
+  const { avgTemp, minTemp, maxTemp, totalPoints } = useMemo(() => {
+    let sum = 0
+    let count = 0
+    let min = Infinity
+    let max = -Infinity
+
+    selectedContainers.forEach((id) => {
+      const traj = trajectoryMap.get(id)
+      if (traj) {
+        traj.forEach((p) => {
+          sum += p.temperature
+          count++
+          min = Math.min(min, p.temperature)
+          max = Math.max(max, p.temperature)
+        })
+      }
+    })
+
+    return {
+      avgTemp: count > 0 ? sum / count : 0,
+      minTemp: min === Infinity ? 0 : min,
+      maxTemp: max === -Infinity ? 0 : max,
+      totalPoints: count,
+    }
+  }, [selectedContainers, trajectoryMap])
+
+  const primaryTrajectory = useMemo(() => {
+    if (selectedContainers.length === 0) return []
+    const firstId = selectedContainers[0]
+    return trajectoryMap.get(firstId) || []
+  }, [selectedContainers, trajectoryMap])
 
   const attributionSegments = attributionResult?.segments.map((seg) => ({
     lat_start: seg.lat_start,
@@ -136,6 +208,13 @@ export default function CargoMonitorPage() {
     sea_area: seg.sea_area,
     confidence: seg.confidence,
   }))
+
+  const handlePointClick = useCallback(
+    (containerId: string, point: TrajectoryPoint) => {
+      console.log('Point clicked:', containerId, point)
+    },
+    []
+  )
 
   return (
     <div className="min-h-screen dark-bg p-4">
@@ -163,9 +242,11 @@ export default function CargoMonitorPage() {
       <div className="grid grid-cols-4 gap-4 mb-4">
         <StatCard
           title="在途集装箱"
-          value={containers.length}
+          value={`${selectedContainers.length}/${containers.length}`}
           icon="📦"
           color="text-blue-400"
+          trend="已选中对比"
+          trendType="neutral"
         />
         <StatCard
           title="当前异常"
@@ -177,9 +258,11 @@ export default function CargoMonitorPage() {
         />
         <StatCard
           title="平均温度"
-          value={avgTemp.toFixed(1) + '°C'}
+          value={formatTemperature(avgTemp)}
           icon="🌡️"
           color={avgTemp < -12 ? 'text-green-400' : 'text-yellow-400'}
+          trend={`最高 ${formatTemperature(maxTemp)}`}
+          trendType={maxTemp > -10 ? 'up' : 'down'}
         />
         <StatCard
           title="已处理赔偿"
@@ -195,8 +278,9 @@ export default function CargoMonitorPage() {
         <div className="col-span-2">
           <ContainerList
             containers={containers}
-            selectedContainer={selectedContainer}
-            onSelectContainer={handleSelectContainer}
+            selectedContainers={selectedContainers}
+            onToggleContainer={handleToggleContainer}
+            multiSelect={true}
           />
         </div>
 
@@ -204,9 +288,9 @@ export default function CargoMonitorPage() {
           <div className="flex-1 card-glass p-3 relative">
             {mapReady ? (
               <WorldMap
-                trajectory={trajectory}
-                selectedContainer={selectedContainer}
+                trajectories={mapTrajectories}
                 attributionSegments={attributionSegments}
+                onPointClick={handlePointClick}
               />
             ) : (
               <div className="w-full h-full flex items-center justify-center">
@@ -217,16 +301,37 @@ export default function CargoMonitorPage() {
               <TemperatureLegend />
             </div>
             <div className="absolute top-4 right-4">
-              <div className="card-glass px-3 py-2 text-sm">
-                <span className="text-gray-400">当前选择: </span>
-                <span className="text-white font-medium">{selectedContainer}</span>
+              <div className="card-glass px-3 py-2">
+                <div className="text-xs text-gray-400 mb-1">已选航线 ({selectedContainers.length})</div>
+                <div className="flex flex-wrap gap-1 max-w-xs">
+                  {selectedContainers.slice(0, 3).map((id) => (
+                    <span
+                      key={id}
+                      className="text-xs bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded"
+                    >
+                      {id.replace('CONT-SEA-', '#')}
+                    </span>
+                  ))}
+                  {selectedContainers.length > 3 && (
+                    <span className="text-xs text-gray-500">
+                      +{selectedContainers.length - 3}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
           </div>
 
           <div className="card-glass p-3" style={{ height: '220px' }}>
-            <div className="text-sm text-gray-400 mb-2">📈 温度趋势图 (近7天)</div>
-            <TempChart trajectory={trajectory} height={170} />
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm text-gray-400">📈 温度趋势图 (近7天)</div>
+              {selectedContainers.length > 0 && (
+                <div className="text-xs text-blue-400">
+                  主显示: {selectedContainers[0]}
+                </div>
+              )}
+            </div>
+            <TempChart trajectory={primaryTrajectory} height={170} />
           </div>
         </div>
 
