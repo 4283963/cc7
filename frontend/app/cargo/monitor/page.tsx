@@ -6,10 +6,12 @@ import {
   containerApi,
   anomalyApi,
   attributionApi,
+  shelfLifeApi,
   ContainerInfo,
   AnomalyEvent,
   TrajectoryPoint,
   AttributionResult,
+  ShelfLifePrediction,
 } from '@/lib/api'
 import ContainerList from '@/components/ContainerList'
 import AnomalyPanel from '@/components/AnomalyPanel'
@@ -18,6 +20,7 @@ import StatCard from '@/components/StatCard'
 import TemperatureLegend from '@/components/TemperatureLegend'
 import TempChart from '@/components/TempChart'
 import CurrentTime from '@/components/CurrentTime'
+import ShelfLifeCard from '@/components/ShelfLifeCard'
 import { registerWorldMap } from '@/lib/mapData'
 import { formatTemperature } from '@/lib/utils'
 
@@ -37,6 +40,8 @@ export default function CargoMonitorPage() {
   const [selectedContainers, setSelectedContainers] = useState<string[]>(DEFAULT_SELECTED)
   const [trajectoryMap, setTrajectoryMap] = useState<Map<string, TrajectoryPoint[]>>(new Map())
   const [loadingContainers, setLoadingContainers] = useState<Set<string>>(new Set())
+  const [shelfLifeMap, setShelfLifeMap] = useState<Record<string, ShelfLifePrediction>>({})
+  const [loadingShelfLife, setLoadingShelfLife] = useState<Set<string>>(new Set())
   const [anomalies, setAnomalies] = useState<AnomalyEvent[]>([])
   const [selectedAnomaly, setSelectedAnomaly] = useState<AnomalyEvent | null>(null)
   const [attributionResult, setAttributionResult] = useState<AttributionResult | null>(null)
@@ -73,6 +78,25 @@ export default function CargoMonitorPage() {
     }
   }, [])
 
+  const loadShelfLife = useCallback(async (containerId: string) => {
+    setLoadingShelfLife((prev) => new Set(prev).add(containerId))
+    try {
+      const res = await shelfLifeApi.getPrediction(containerId, 48)
+      setShelfLifeMap((prev) => ({
+        ...prev,
+        [containerId]: res.data,
+      }))
+    } catch (e) {
+      console.error('Failed to load shelf life:', e)
+    } finally {
+      setLoadingShelfLife((prev) => {
+        const next = new Set(prev)
+        next.delete(containerId)
+        return next
+      })
+    }
+  }, [])
+
   const handleToggleContainer = useCallback(
     (containerId: string) => {
       setSelectedContainers((prev) => {
@@ -83,11 +107,14 @@ export default function CargoMonitorPage() {
           if (!trajectoryMap.has(containerId) && !loadingContainers.has(containerId)) {
             loadTrajectory(containerId)
           }
+          if (!shelfLifeMap[containerId] && !loadingShelfLife.has(containerId)) {
+            loadShelfLife(containerId)
+          }
           return [...prev, containerId]
         }
       })
     },
-    [trajectoryMap, loadingContainers, loadTrajectory]
+    [trajectoryMap, loadingContainers, shelfLifeMap, loadingShelfLife, loadTrajectory, loadShelfLife]
   )
 
   const loadAnomalies = useCallback(async () => {
@@ -111,6 +138,9 @@ export default function CargoMonitorPage() {
         if (!trajectoryMap.has(anomaly.container_id)) {
           await loadTrajectory(anomaly.container_id)
         }
+        if (!shelfLifeMap[anomaly.container_id]) {
+          await loadShelfLife(anomaly.container_id)
+        }
       }
 
       try {
@@ -122,7 +152,7 @@ export default function CargoMonitorPage() {
         setAttributionLoading(false)
       }
     },
-    [selectedContainers, trajectoryMap, loadTrajectory]
+    [selectedContainers, trajectoryMap, shelfLifeMap, loadTrajectory, loadShelfLife]
   )
 
   const handleUpdateOrder = useCallback(
@@ -150,12 +180,17 @@ export default function CargoMonitorPage() {
   useEffect(() => {
     if (containers.length > 0) {
       DEFAULT_SELECTED.forEach((id) => {
-        if (containers.some((c) => c.id === id) && !trajectoryMap.has(id)) {
-          loadTrajectory(id)
+        if (containers.some((c) => c.id === id)) {
+          if (!trajectoryMap.has(id) && !loadingContainers.has(id)) {
+            loadTrajectory(id)
+          }
+          if (!shelfLifeMap[id] && !loadingShelfLife.has(id)) {
+            loadShelfLife(id)
+          }
         }
       })
     }
-  }, [containers, trajectoryMap, loadTrajectory])
+  }, [containers, trajectoryMap, loadingContainers, shelfLifeMap, loadingShelfLife, loadTrajectory, loadShelfLife])
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -193,6 +228,10 @@ export default function CargoMonitorPage() {
     }
   }, [selectedContainers, trajectoryMap])
 
+  const primaryContainer = selectedContainers[0] || ''
+  const primaryShelfLife = primaryContainer ? shelfLifeMap[primaryContainer] || null : null
+  const primaryShelfLifeLoading = primaryContainer ? loadingShelfLife.has(primaryContainer) : false
+
   const primaryTrajectory = useMemo(() => {
     if (selectedContainers.length === 0) return []
     const firstId = selectedContainers[0]
@@ -215,6 +254,12 @@ export default function CargoMonitorPage() {
     },
     []
   )
+
+  const criticalShelfLifeCount = useMemo(() => {
+    return Object.values(shelfLifeMap).filter(
+      (s) => s.quality_level === 'critical' || s.quality_level === 'poor'
+    ).length
+  }, [shelfLifeMap])
 
   return (
     <div className="min-h-screen dark-bg p-4">
@@ -265,12 +310,12 @@ export default function CargoMonitorPage() {
           trendType={maxTemp > -10 ? 'up' : 'down'}
         />
         <StatCard
-          title="已处理赔偿"
-          value="3"
-          icon="💰"
-          color="text-purple-400"
-          trend="本月"
-          trendType="neutral"
+          title="品质预警"
+          value={criticalShelfLifeCount}
+          icon="🧪"
+          color="text-orange-400"
+          trend="货柜需关注"
+          trendType={criticalShelfLifeCount > 0 ? 'up' : 'neutral'}
         />
       </div>
 
@@ -281,6 +326,8 @@ export default function CargoMonitorPage() {
             selectedContainers={selectedContainers}
             onToggleContainer={handleToggleContainer}
             multiSelect={true}
+            shelfLifeMap={shelfLifeMap}
+            loadingShelfLife={loadingShelfLife}
           />
         </div>
 
@@ -336,8 +383,14 @@ export default function CargoMonitorPage() {
         </div>
 
         <div className="col-span-3 flex flex-col gap-4">
+          <ShelfLifeCard
+            prediction={primaryShelfLife}
+            loading={primaryShelfLifeLoading}
+            containerId={primaryContainer}
+          />
+
           {!showAttribution ? (
-            <div className="flex-1">
+            <div className="flex-1 min-h-0">
               <AnomalyPanel
                 anomalies={anomalies}
                 selectedAnomaly={selectedAnomaly}
@@ -346,7 +399,7 @@ export default function CargoMonitorPage() {
               />
             </div>
           ) : (
-            <div className="flex-1">
+            <div className="flex-1 min-h-0">
               <AttributionPanel
                 result={attributionResult}
                 loading={attributionLoading}

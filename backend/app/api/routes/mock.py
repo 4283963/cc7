@@ -10,6 +10,7 @@ from ...mock.mock_data import (
     get_container_info,
     MOCK_CONTAINERS,
 )
+from ...utils.shelf_life import predict_shelf_life_from_trajectory
 
 router = APIRouter(prefix="/api/mock", tags=["mock"])
 
@@ -122,3 +123,52 @@ async def update_order_status(order_id: int, request: dict):
     order["updated_at"] = datetime.now().isoformat()
 
     return order
+
+
+@router.get("/shelf-life/{container_id}")
+async def get_mock_shelf_life(
+    container_id: str,
+    lookback_hours: int = Query(48, ge=1, le=336),
+):
+    container_info = next((c for c in MOCK_CONTAINERS if c["id"] == container_id), None)
+    if not container_info:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    cargo_type = container_info.get("cargo", "默认")
+    trajectory = generate_mock_trajectory(container_id, lookback_hours)
+
+    result = predict_shelf_life_from_trajectory(trajectory, cargo_type, lookback_hours)
+
+    return {
+        "container_id": container_id,
+        "cargo_type": cargo_type,
+        "lookback_hours": lookback_hours,
+        **result,
+    }
+
+
+@router.post("/shelf-life/batch")
+async def batch_mock_shelf_life(request: dict):
+    container_ids = request.get("container_ids", [])
+    lookback_hours = request.get("lookback_hours", 48)
+
+    if not container_ids:
+        raise HTTPException(status_code=400, detail="container_ids is required")
+
+    results = {}
+    for cid in container_ids:
+        container_info = next((c for c in MOCK_CONTAINERS if c["id"] == cid), None)
+        if not container_info:
+            results[cid] = {"error": "Container not found"}
+            continue
+
+        cargo_type = container_info.get("cargo", "默认")
+        trajectory = generate_mock_trajectory(cid, lookback_hours)
+        result = predict_shelf_life_from_trajectory(trajectory, cargo_type, lookback_hours)
+        results[cid] = result
+
+    return {
+        "lookback_hours": lookback_hours,
+        "count": len(results),
+        "results": results,
+    }

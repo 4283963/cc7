@@ -142,4 +142,50 @@ export const orderApi = {
     }),
 }
 
+export interface ShelfLifePrediction {
+  container_id: string
+  cargo_type: string
+  lookback_hours: number
+  product: string
+  base_shelf_life_hours: number
+  reference_temp_c: number
+  q10_factor: number
+  total_actual_hours: number
+  total_equivalent_aging_hours: number
+  remaining_shelf_life_hours: number
+  remaining_ratio: number
+  spoiled_ratio: number
+  quality_level: 'excellent' | 'good' | 'fair' | 'poor' | 'critical'
+  average_temp_c: number
+  max_temp_c: number
+  min_temp_c: number
+  max_degradation_rate: number
+  predicted_remaining_hours_at_current_rate: number | null
+  rate_history?: Array<{
+    segment_index: number
+    temperature_c: number
+    duration_hours: number
+    degradation_rate: number
+    equivalent_hours: number
+    is_safe: boolean
+  }>
+}
+
+export const shelfLifeApi = {
+  getPrediction: (containerId: string, lookbackHours = 48) =>
+    api.get<ShelfLifePrediction>(`${prefix}/shelf-life/${containerId}`, {
+      params: { lookback_hours: lookbackHours },
+    }),
+
+  getBatch: (containerIds: string[], lookbackHours = 48) =>
+    api.post<{
+      lookback_hours: number
+      count: number
+      results: Record<string, ShelfLifePrediction | { error: string }>
+    }>(`${prefix}/shelf-life/batch`, {
+      container_ids: containerIds,
+      lookback_hours: lookbackHours,
+    }),
+}
+
 export default api

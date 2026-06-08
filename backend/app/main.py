@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .api.routes import container, attribution, anomaly, mock
+from .api.routes import container, attribution, anomaly, mock, shelf_life
 from .config import settings
 
 app = FastAPI(
@@ -20,6 +20,7 @@ app.add_middleware(
 app.include_router(container.router)
 app.include_router(attribution.router)
 app.include_router(anomaly.router)
+app.include_router(shelf_life.router)
 app.include_router(mock.router)
 
 
